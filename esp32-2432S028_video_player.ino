@@ -22,6 +22,7 @@
 
 #define BOOT_PIN 0                   // Boot pin
 #define BOOT_BUTTON_DEBOUCE_TIME 400 // Debounce time when reading the boot button in milliseconds
+#define TOUCH_POLL_INTERVAL_MS 100   // Poll touch screen every 100ms instead of every frame
 
 // Some model of cheap Yellow display works only at 40Mhz
 // #define DISPLAY_SPI_SPEED 40000000L // 40MHz
@@ -111,7 +112,7 @@ void setup()
 
     // Buffer allocation for mjpeg playing
     Serial.println("Buffer allocation");
-    output_buf_size = gfx->width() * 4 * 2;
+    output_buf_size = gfx->width() * 16 * 2;  // Increased from 4 to 16 scanlines
     output_buf = (uint16_t *)heap_caps_aligned_alloc(16, output_buf_size * sizeof(uint16_t), MALLOC_CAP_DMA);
     if (!output_buf)
     {
@@ -121,7 +122,7 @@ void setup()
             /* no need to continue */
         }
     }
-    estimateBufferSize = gfx->width() * gfx->height() * 2 / 5;
+    estimateBufferSize = gfx->width() * gfx->height() * 3 / 5;  // Increased from 2/5 to 3/5 (60% of screen)
     mjpeg_buf = (uint8_t *)heap_caps_malloc(estimateBufferSize, MALLOC_CAP_8BIT);
     if (!mjpeg_buf)
     {
@@ -197,12 +198,18 @@ void mjpegPlayFromSDCard(char *mjpegFilename)
             &mjpegFile, mjpeg_buf, jpegDrawCallback, true /* useBigEndian */,
             0 /* x */, 0 /* y */, gfx->width() /* widthLimit */, gfx->height() /* heightLimit */);
 
+        unsigned long lastTouchPoll = 0;
         while (!skipRequested && mjpegFile.available() && mjpeg.readMjpegBuf())
         {
-            // Check for touch input to skip video
-            if (touch.Pressed())
+            // Check for touch input to skip video (polled less frequently to save CPU)
+            unsigned long now = millis();
+            if (now - lastTouchPoll >= TOUCH_POLL_INTERVAL_MS)
             {
-                skipRequested = true;
+                lastTouchPoll = now;
+                if (touch.Pressed())
+                {
+                    skipRequested = true;
+                }
             }
 
             // Read video

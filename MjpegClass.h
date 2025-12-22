@@ -7,7 +7,7 @@
 #ifndef _MJPEGCLASS_H_
 #define _MJPEGCLASS_H_
 
-#define READ_BUFFER_SIZE 1024
+#define READ_BUFFER_SIZE 8192  // Increased from 1024 for better SD card throughput
 #define MAXOUTPUTSIZE (MAX_BUFFERED_PIXELS / 16 / 16)
 
 /* Wio Terminal */
@@ -24,8 +24,8 @@
 class MjpegClass
 {
 public:
-  int getWidth() const { return _jpgWidth; }   
-  int getHeight() const { return _jpgHeight; } 
+  int getWidth() const { return _jpgWidth; }
+  int getHeight() const { return _jpgHeight; }
   int getScale() const { return _scale; }      // 0, 1⁄2, 1⁄4, 1⁄8  (JPEG_SCALE_x)
 
   bool setup(
