@@ -5,6 +5,13 @@
                                  // Install "JPEGDEC" with the Library Manager (last tested on v1.8.2)
 #include "MjpegClass.h"          // Included in this project
 #include "SD.h"                  // Included with the Espressif Arduino Core (last tested on v3.2.0)
+#include <TFT_Touch.h>           // Touch screen library - Install "TFT_Touch" with the Library Manager
+
+// Touch screen pins (XPT2046 on ESP32-2432S028)
+#define T_DO   39   // Data out pin (MISO)
+#define T_DIN  32   // Data in pin (MOSI)
+#define T_CS   33   // Chip select pin
+#define T_CLK  25   // Clock pin
 
 // Pins for the display
 #define BL_PIN 21 // On some cheap yellow display model, BL pin is 27
@@ -17,8 +24,8 @@
 #define BOOT_BUTTON_DEBOUCE_TIME 400 // Debounce time when reading the boot button in milliseconds
 
 // Some model of cheap Yellow display works only at 40Mhz
-// #define DISPLAY_SPI_SPEED 40000000L // 40MHz 
-#define DISPLAY_SPI_SPEED 80000000L // 80MHz 
+// #define DISPLAY_SPI_SPEED 40000000L // 40MHz
+#define DISPLAY_SPI_SPEED 80000000L // 80MHz
 
 
 #define SD_SPI_SPEED 80000000L      // 80Mhz
@@ -50,6 +57,9 @@ Arduino_GFX *gfx = new Arduino_ILI9341(bus);
 
 // SD Card reader is on a separate SPI
 SPIClass sd_spi(VSPI);
+
+// Touch screen instance
+TFT_Touch touch = TFT_Touch(T_CS, T_CLK, T_DIN, T_DO);
 
 // Interrupt to skip to the next mjpeg when the boot button is pressed
 volatile bool skipRequested = false; // set in ISR, read in loop()
@@ -84,6 +94,9 @@ void setup()
     gfx->fillScreen(RGB565_BLACK);
     // gfx->invertDisplay(true); // on some cheap yellow models, display must be inverted
     Serial.printf("Screeen size Width=%d,Height=%d\n", gfx->width(), gfx->height());
+
+    // Touch screen initialization
+    touch.setRotation(0); // Match display rotation
 
     // SD card initialization
     Serial.println("SD Card initialization");
@@ -122,7 +135,7 @@ void setup()
     loadMjpegFilesList(); // Load the list of mjpeg to play from the SD card
 
     // Set the boot button to skip the current mjpeg playing and go to the next
-    pinMode(BOOT_PIN, INPUT);                        
+    pinMode(BOOT_PIN, INPUT);
     attachInterrupt(digitalPinToInterrupt(BOOT_PIN), // fast ISR
                     onButtonPress, FALLING);         // press == LOW
 }
@@ -186,6 +199,12 @@ void mjpegPlayFromSDCard(char *mjpegFilename)
 
         while (!skipRequested && mjpegFile.available() && mjpeg.readMjpegBuf())
         {
+            // Check for touch input to skip video
+            if (touch.Pressed())
+            {
+                skipRequested = true;
+            }
+
             // Read video
             total_read_video += millis() - curr_ms;
             curr_ms = millis();
