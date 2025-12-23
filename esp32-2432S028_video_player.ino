@@ -5,6 +5,13 @@
                                  // Install "JPEGDEC" with the Library Manager (last tested on v1.8.2)
 #include "MjpegClass.h"          // Included in this project
 #include "SD.h"                  // Included with the Espressif Arduino Core (last tested on v3.2.0)
+#include <TFT_Touch.h>           // Touch screen library - Install "TFT_Touch" with the Library Manager
+
+// Touch screen pins (XPT2046 on ESP32-2432S028)
+#define T_DO   39   // Data out pin (MISO)
+#define T_DIN  32   // Data in pin (MOSI)
+#define T_CS   33   // Chip select pin
+#define T_CLK  25   // Clock pin
 
 // Pins for the display
 #define BL_PIN 21 // On some cheap yellow display model, BL pin is 27
@@ -15,10 +22,12 @@
 
 #define BOOT_PIN 0                   // Boot pin
 #define BOOT_BUTTON_DEBOUCE_TIME 400 // Debounce time when reading the boot button in milliseconds
+#define TOUCH_POLL_INTERVAL_MS 100   // Poll touch screen every 100ms instead of every frame
+#define TOUCH_SKIP_DEBOUNCE_MS 1000  // Only skip one video per second when touch is held
 
 // Some model of cheap Yellow display works only at 40Mhz
-// #define DISPLAY_SPI_SPEED 40000000L // 40MHz 
-#define DISPLAY_SPI_SPEED 80000000L // 80MHz 
+// #define DISPLAY_SPI_SPEED 40000000L // 40MHz
+#define DISPLAY_SPI_SPEED 80000000L // 80MHz
 
 
 #define SD_SPI_SPEED 80000000L      // 80Mhz
@@ -51,10 +60,14 @@ Arduino_GFX *gfx = new Arduino_ILI9341(bus);
 // SD Card reader is on a separate SPI
 SPIClass sd_spi(VSPI);
 
+// Touch screen instance
+TFT_Touch touch = TFT_Touch(T_CS, T_CLK, T_DIN, T_DO);
+
 // Interrupt to skip to the next mjpeg when the boot button is pressed
 volatile bool skipRequested = false; // set in ISR, read in loop()
 volatile uint32_t isrTick = 0;       // tick count captured in ISR
-uint32_t lastPress = 0;              // used in main context for debounc
+uint32_t lastPress = 0;              // used in main context for debounce
+uint32_t lastTouchSkip = 0;          // debounce for touch screen skips
 
 void IRAM_ATTR onButtonPress()
 {
@@ -85,6 +98,9 @@ void setup()
     // gfx->invertDisplay(true); // on some cheap yellow models, display must be inverted
     Serial.printf("Screeen size Width=%d,Height=%d\n", gfx->width(), gfx->height());
 
+    // Touch screen initialization
+    touch.setRotation(0); // Match display rotation
+
     // SD card initialization
     Serial.println("SD Card initialization");
     if (!SD.begin(SD_CS, sd_spi, SD_SPI_SPEED, "/sd"))
@@ -98,7 +114,7 @@ void setup()
 
     // Buffer allocation for mjpeg playing
     Serial.println("Buffer allocation");
-    output_buf_size = gfx->width() * 4 * 2;
+    output_buf_size = gfx->width() * 16 * 2;  // Increased from 4 to 16 scanlines
     output_buf = (uint16_t *)heap_caps_aligned_alloc(16, output_buf_size * sizeof(uint16_t), MALLOC_CAP_DMA);
     if (!output_buf)
     {
@@ -108,7 +124,7 @@ void setup()
             /* no need to continue */
         }
     }
-    estimateBufferSize = gfx->width() * gfx->height() * 2 / 5;
+    estimateBufferSize = gfx->width() * gfx->height() * 3 / 5;  // Increased from 2/5 to 3/5 (60% of screen)
     mjpeg_buf = (uint8_t *)heap_caps_malloc(estimateBufferSize, MALLOC_CAP_8BIT);
     if (!mjpeg_buf)
     {
@@ -122,7 +138,7 @@ void setup()
     loadMjpegFilesList(); // Load the list of mjpeg to play from the SD card
 
     // Set the boot button to skip the current mjpeg playing and go to the next
-    pinMode(BOOT_PIN, INPUT);                        
+    pinMode(BOOT_PIN, INPUT);
     attachInterrupt(digitalPinToInterrupt(BOOT_PIN), // fast ISR
                     onButtonPress, FALLING);         // press == LOW
 }
@@ -184,8 +200,22 @@ void mjpegPlayFromSDCard(char *mjpegFilename)
             &mjpegFile, mjpeg_buf, jpegDrawCallback, true /* useBigEndian */,
             0 /* x */, 0 /* y */, gfx->width() /* widthLimit */, gfx->height() /* heightLimit */);
 
+        unsigned long lastTouchPoll = 0;
         while (!skipRequested && mjpegFile.available() && mjpeg.readMjpegBuf())
         {
+            // Check for touch input to skip video (polled less frequently to save CPU)
+            unsigned long now = millis();
+            if (now - lastTouchPoll >= TOUCH_POLL_INTERVAL_MS)
+            {
+                lastTouchPoll = now;
+                // Only skip if touch is pressed AND enough time has passed since last touch skip
+                if (touch.Pressed() && (now - lastTouchSkip >= TOUCH_SKIP_DEBOUNCE_MS))
+                {
+                    lastTouchSkip = now;
+                    skipRequested = true;
+                }
+            }
+
             // Read video
             total_read_video += millis() - curr_ms;
             curr_ms = millis();
