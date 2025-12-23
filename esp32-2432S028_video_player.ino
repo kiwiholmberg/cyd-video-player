@@ -27,7 +27,7 @@
 
 // Some model of cheap Yellow display works only at 40Mhz
 // #define DISPLAY_SPI_SPEED 40000000L // 40MHz
-#define DISPLAY_SPI_SPEED 80000000L // 80MHz
+#define DISPLAY_SPI_SPEED 40000000L // 80MHz
 
 
 #define SD_SPI_SPEED 80000000L      // 80Mhz
@@ -44,14 +44,43 @@ static File mjpegFile; // temp gif file holder
 
 // Global variables for mjpeg
 MjpegClass mjpeg;
-int total_frames;
-unsigned long total_read_video;
-unsigned long total_decode_video;
-unsigned long total_show_video;
-unsigned long start_ms, curr_ms;
 long output_buf_size, estimateBufferSize;
-uint8_t *mjpeg_buf;
+uint8_t *mjpeg_buf[2];           // Double buffer for dual-core
+int32_t mjpeg_buf_len[2] = {0};  // Frame size in each buffer
 uint16_t *output_buf;
+
+// Dual-core synchronization
+#define NUM_BUFFERS 2
+#define READER_TASK_STACK_SIZE 4096
+#define READER_TASK_PRIORITY 1
+SemaphoreHandle_t bufferFull[NUM_BUFFERS];   // Signals buffer has frame data
+SemaphoreHandle_t bufferEmpty[NUM_BUFFERS];  // Signals buffer is ready for refill
+TaskHandle_t readerTaskHandle = NULL;
+volatile bool playbackDone = false;          // Signals end of video to reader
+volatile bool readerFinished = false;        // Reader task has exited
+volatile bool endOfFile = false;             // No more frames to read
+
+// Detailed timing stats structure
+struct VideoStats {
+    unsigned long totalRead = 0;
+    unsigned long totalDecode = 0;
+    unsigned long totalDisplay = 0;
+    unsigned long totalTouchPoll = 0;
+    unsigned long totalOverhead = 0;
+    unsigned long totalWait = 0;         // Time waiting for buffer (dual-core)
+    unsigned long maxRead = 0;
+    unsigned long maxDecode = 0;
+    unsigned long maxDisplay = 0;
+    unsigned long maxWait = 0;           // Max wait time for buffer
+    int frames = 0;
+    unsigned long startTime = 0;
+};
+
+// Set to true to enable per-frame logging (verbose)
+#define VERBOSE_FRAME_LOG false
+
+// Global stats instance (reset per video)
+VideoStats stats;
 
 // Display global variables
 Arduino_DataBus *bus = new Arduino_HWSPI(2 /* DC */, 15 /* CS */, 14 /* SCK */, 13 /* MOSI */, 12 /* MISO */);
@@ -73,6 +102,43 @@ void IRAM_ATTR onButtonPress()
 {
     skipRequested = true;                 // flag handled in the playback loop
     isrTick = xTaskGetTickCountFromISR(); // safe, 1-tick resolution
+}
+
+// Reader task runs on Core 0 - reads MJPEG frames into double buffer
+void readerTask(void *param)
+{
+    int writeIndex = 0;
+    Serial.printf("[Reader] Started on Core %d\n", xPortGetCoreID());
+
+    while (!playbackDone)
+    {
+        // Wait for buffer to be empty (available for writing)
+        if (xSemaphoreTake(bufferEmpty[writeIndex], pdMS_TO_TICKS(100)) == pdTRUE)
+        {
+            if (playbackDone) break;
+
+            // Read next frame into this buffer
+            bool hasFrame = mjpeg.readMjpegBufTo(mjpeg_buf[writeIndex], &mjpeg_buf_len[writeIndex]);
+
+            if (hasFrame)
+            {
+                // Signal that buffer is full and ready for decoding
+                xSemaphoreGive(bufferFull[writeIndex]);
+                writeIndex = (writeIndex + 1) % NUM_BUFFERS;
+            }
+            else
+            {
+                // No more frames - signal end of file
+                endOfFile = true;
+                xSemaphoreGive(bufferFull[writeIndex]); // Wake up consumer
+                break;
+            }
+        }
+    }
+
+    Serial.printf("[Reader] Finished on Core %d\n", xPortGetCoreID());
+    readerFinished = true;
+    vTaskDelete(NULL);
 }
 
 void setup()
@@ -124,16 +190,22 @@ void setup()
             /* no need to continue */
         }
     }
-    estimateBufferSize = gfx->width() * gfx->height() * 3 / 5;  // Increased from 2/5 to 3/5 (60% of screen)
-    mjpeg_buf = (uint8_t *)heap_caps_malloc(estimateBufferSize, MALLOC_CAP_8BIT);
-    if (!mjpeg_buf)
+
+    // Allocate double buffer for dual-core operation
+    estimateBufferSize = gfx->width() * gfx->height() * 3 / 5;  // 60% of screen per buffer
+    for (int i = 0; i < NUM_BUFFERS; i++)
     {
-        Serial.println("mjpeg_buf allocation failed!");
-        while (true)
+        mjpeg_buf[i] = (uint8_t *)heap_caps_malloc(estimateBufferSize, MALLOC_CAP_8BIT);
+        if (!mjpeg_buf[i])
         {
-            /* no need to continue */
+            Serial.printf("mjpeg_buf[%d] allocation failed!\n", i);
+            while (true)
+            {
+                /* no need to continue */
+            }
         }
     }
+    Serial.printf("Allocated %d MJPEG buffers of %ld bytes each\n", NUM_BUFFERS, estimateBufferSize);
 
     loadMjpegFilesList(); // Load the list of mjpeg to play from the SD card
 
@@ -168,16 +240,72 @@ void playSelectedMjpeg(int mjpegIndex)
 // Callback function to draw a JPEG
 int jpegDrawCallback(JPEGDRAW *pDraw)
 {
-    unsigned long s = millis();
+    unsigned long s = micros();
     gfx->draw16bitBeRGBBitmap(pDraw->x, pDraw->y, pDraw->pPixels, pDraw->iWidth, pDraw->iHeight);
-    total_show_video += millis() - s;
+    unsigned long elapsed = micros() - s;
+    stats.totalDisplay += elapsed;
+    if (elapsed > stats.maxDisplay) {
+        stats.maxDisplay = elapsed;
+    }
     return 1;
 }
 
-// Play a mjpeg stored on the SD card
+// Print detailed video statistics
+void printVideoStats(const char *filename)
+{
+    unsigned long totalTime = millis() - stats.startTime;
+    float fps = (totalTime > 0) ? (1000.0f * stats.frames / totalTime) : 0;
+
+    // Convert micros to millis for display
+    float avgRead = (stats.frames > 0) ? (stats.totalRead / 1000.0f / stats.frames) : 0;
+    float avgDecode = (stats.frames > 0) ? (stats.totalDecode / 1000.0f / stats.frames) : 0;
+    float avgDisplay = (stats.frames > 0) ? (stats.totalDisplay / 1000.0f / stats.frames) : 0;
+    float avgTouchPoll = (stats.frames > 0) ? (stats.totalTouchPoll / 1000.0f / stats.frames) : 0;
+    float avgOverhead = (stats.frames > 0) ? (stats.totalOverhead / 1000.0f / stats.frames) : 0;
+    float avgWait = (stats.frames > 0) ? (stats.totalWait / 1000.0f / stats.frames) : 0;
+    float avgTotal = avgRead + avgDecode + avgDisplay + avgTouchPoll + avgOverhead + avgWait;
+
+    // Calculate percentages
+    float pctRead = (avgTotal > 0) ? (100.0f * avgRead / avgTotal) : 0;
+    float pctDecode = (avgTotal > 0) ? (100.0f * avgDecode / avgTotal) : 0;
+    float pctDisplay = (avgTotal > 0) ? (100.0f * avgDisplay / avgTotal) : 0;
+    float pctTouchPoll = (avgTotal > 0) ? (100.0f * avgTouchPoll / avgTotal) : 0;
+    float pctOverhead = (avgTotal > 0) ? (100.0f * avgOverhead / avgTotal) : 0;
+    float pctWait = (avgTotal > 0) ? (100.0f * avgWait / avgTotal) : 0;
+
+    Serial.println();
+    Serial.println(F("═══════════════════════════════════════════════════"));
+    Serial.printf("Video Stats: %s\n", filename);
+    Serial.println(F("═══════════════════════════════════════════════════"));
+    Serial.printf("Frames: %d | Duration: %lu ms | FPS: %.1f\n", stats.frames, totalTime, fps);
+    Serial.println(F("Mode: DUAL-CORE"));
+    Serial.printf("  Reader:  Core 0 (PRO_CPU)\n");
+    Serial.printf("  Decoder: Core %d (%s)\n", xPortGetCoreID(), xPortGetCoreID() == 1 ? "APP_CPU" : "PRO_CPU");
+    Serial.println();
+    Serial.println(F("Breakdown (avg per frame):"));
+    Serial.printf("  Buf Wait:    %6.2f ms (%5.1f%%) <- lower = better parallelism\n", avgWait, pctWait);
+    Serial.printf("  SD Read:     %6.2f ms (%5.1f%%) [on Core 0]\n", avgRead, pctRead);
+    Serial.printf("  JPEG Decode: %6.2f ms (%5.1f%%)\n", avgDecode, pctDecode);
+    Serial.printf("  Display:     %6.2f ms (%5.1f%%)\n", avgDisplay, pctDisplay);
+    Serial.printf("  Touch Poll:  %6.2f ms (%5.1f%%)\n", avgTouchPoll, pctTouchPoll);
+    Serial.printf("  Overhead:    %6.2f ms (%5.1f%%)\n", avgOverhead, pctOverhead);
+    Serial.println(F("  ───────────────────────────────────"));
+    Serial.printf("  Total:       %6.2f ms (100.0%%)\n", avgTotal);
+    Serial.println();
+    Serial.println(F("Peak times:"));
+    Serial.printf("  Wait max: %.2f ms | Decode max: %.2f ms | Display max: %.2f ms\n",
+                  stats.maxWait / 1000.0f, stats.maxDecode / 1000.0f, stats.maxDisplay / 1000.0f);
+    Serial.printf("Video size: %d×%d, scale factor: %d\n", mjpeg.getWidth(), mjpeg.getHeight(), mjpeg.getScale());
+    Serial.println(F("═══════════════════════════════════════════════════"));
+    Serial.println();
+}
+
+// Play a mjpeg stored on the SD card (dual-core implementation)
 void mjpegPlayFromSDCard(char *mjpegFilename)
 {
     Serial.printf("Opening %s\n", mjpegFilename);
+    Serial.printf("[Decoder] Running on Core: %d (%s)\n", xPortGetCoreID(), xPortGetCoreID() == 1 ? "APP_CPU" : "PRO_CPU");
+
     File mjpegFile = SD.open(mjpegFilename, "r");
 
     if (!mjpegFile || mjpegFile.isDirectory())
@@ -186,75 +314,165 @@ void mjpegPlayFromSDCard(char *mjpegFilename)
     }
     else
     {
-        Serial.println("MJPEG start");
+        Serial.println("MJPEG start (dual-core)");
         gfx->fillScreen(RGB565_BLACK);
 
-        start_ms = millis();
-        curr_ms = millis();
-        total_frames = 0;
-        total_read_video = 0;
-        total_decode_video = 0;
-        total_show_video = 0;
+        // Reset stats for this video
+        stats = VideoStats();
+        stats.startTime = millis();
 
+        // Setup mjpeg with first buffer (used for scaling detection on first frame)
         mjpeg.setup(
-            &mjpegFile, mjpeg_buf, jpegDrawCallback, true /* useBigEndian */,
+            &mjpegFile, mjpeg_buf[0], jpegDrawCallback, true /* useBigEndian */,
             0 /* x */, 0 /* y */, gfx->width() /* widthLimit */, gfx->height() /* heightLimit */);
 
-        unsigned long lastTouchPoll = 0;
-        while (!skipRequested && mjpegFile.available() && mjpeg.readMjpegBuf())
+        // Create semaphores for dual-core synchronization
+        for (int i = 0; i < NUM_BUFFERS; i++)
         {
-            // Check for touch input to skip video (polled less frequently to save CPU)
-            unsigned long now = millis();
-            if (now - lastTouchPoll >= TOUCH_POLL_INTERVAL_MS)
+            bufferFull[i] = xSemaphoreCreateBinary();
+            bufferEmpty[i] = xSemaphoreCreateBinary();
+            xSemaphoreGive(bufferEmpty[i]); // Initially all buffers are empty/available
+            mjpeg_buf_len[i] = 0;
+        }
+
+        // Reset control flags
+        playbackDone = false;
+        readerFinished = false;
+        endOfFile = false;
+
+        // Start reader task on Core 0 (PRO_CPU)
+        xTaskCreatePinnedToCore(
+            readerTask,
+            "ReaderTask",
+            READER_TASK_STACK_SIZE,
+            NULL,
+            READER_TASK_PRIORITY,
+            &readerTaskHandle,
+            0  // Core 0 (PRO_CPU)
+        );
+
+        // Consumer loop on Core 1 (APP_CPU)
+        unsigned long lastTouchPollTime = 0;
+        unsigned long frameStart, waitStart, waitEnd, decodeStart, decodeEnd, touchPollStart, touchPollEnd;
+        int readIndex = 0;
+
+        while (!skipRequested && !endOfFile)
+        {
+            frameStart = micros();
+
+            // === Wait for buffer to be filled by reader task ===
+            waitStart = micros();
+            if (xSemaphoreTake(bufferFull[readIndex], pdMS_TO_TICKS(1000)) != pdTRUE)
             {
-                lastTouchPoll = now;
-                // Only skip if touch is pressed AND enough time has passed since last touch skip
+                // Timeout - check if we should exit
+                if (endOfFile || playbackDone) break;
+                continue;
+            }
+            waitEnd = micros();
+
+            // Check if reader signaled end of file
+            if (endOfFile && mjpeg_buf_len[readIndex] == 0) break;
+
+            unsigned long waitElapsed = waitEnd - waitStart;
+            stats.totalWait += waitElapsed;
+            if (waitElapsed > stats.maxWait) {
+                stats.maxWait = waitElapsed;
+            }
+
+            // === Touch Polling (throttled) ===
+            touchPollStart = micros();
+            unsigned long now = millis();
+            if (now - lastTouchPollTime >= TOUCH_POLL_INTERVAL_MS)
+            {
+                lastTouchPollTime = now;
                 if (touch.Pressed() && (now - lastTouchSkip >= TOUCH_SKIP_DEBOUNCE_MS))
                 {
                     lastTouchSkip = now;
                     skipRequested = true;
                 }
             }
+            touchPollEnd = micros();
+            stats.totalTouchPoll += (touchPollEnd - touchPollStart);
 
-            // Read video
-            total_read_video += millis() - curr_ms;
-            curr_ms = millis();
+            // === JPEG Decode from buffer (display time tracked in callback) ===
+            decodeStart = micros();
+            unsigned long displayBefore = stats.totalDisplay;  // Snapshot before decode
+            mjpeg.drawJpgFrom(mjpeg_buf[readIndex], mjpeg_buf_len[readIndex]);
+            decodeEnd = micros();
 
-            // Play video
-            mjpeg.drawJpg();
-            total_decode_video += millis() - curr_ms;
+            // Signal buffer is now empty and available for reader
+            xSemaphoreGive(bufferEmpty[readIndex]);
+            readIndex = (readIndex + 1) % NUM_BUFFERS;
 
-            curr_ms = millis();
-            total_frames++;
-        }
-        /* We exited because the button was pressed or the video ended */
-        if (skipRequested) // pressed?
-        {
-            uint32_t now = millis(); // safe here
-            if (now - lastPress < BOOT_BUTTON_DEBOUCE_TIME)
-            {
-                // ignore if it was within the debounce time
+            // Decode time = total decode call time - display time added during decode
+            unsigned long displayDuring = stats.totalDisplay - displayBefore;
+            unsigned long decodeElapsed = (decodeEnd - decodeStart) - displayDuring;
+            stats.totalDecode += decodeElapsed;
+            if (decodeElapsed > stats.maxDecode) {
+                stats.maxDecode = decodeElapsed;
             }
-            else
+
+            // === Calculate overhead (loop management, etc.) ===
+            unsigned long frameEnd = micros();
+            unsigned long accountedTime = waitElapsed + (touchPollEnd - touchPollStart) + (decodeEnd - decodeStart);
+            unsigned long overhead = (frameEnd - frameStart) - accountedTime;
+            stats.totalOverhead += overhead;
+
+            stats.frames++;
+
+            // Verbose per-frame logging (optional)
+            #if VERBOSE_FRAME_LOG
+            Serial.printf("[Frame %d] Wait:%.1fms Decode:%.1fms Display:%.1fms Poll:%.1fms Total:%.1fms\n",
+                          stats.frames,
+                          waitElapsed / 1000.0f,
+                          decodeElapsed / 1000.0f,
+                          displayDuring / 1000.0f,
+                          (touchPollEnd - touchPollStart) / 1000.0f,
+                          (frameEnd - frameStart) / 1000.0f);
+            #endif
+        }
+
+        // Signal reader task to stop and wait for it to finish
+        playbackDone = true;
+
+        // Give semaphores to unblock reader if it's waiting
+        for (int i = 0; i < NUM_BUFFERS; i++)
+        {
+            xSemaphoreGive(bufferEmpty[i]);
+        }
+
+        // Wait for reader task to finish (with timeout)
+        int waitCount = 0;
+        while (!readerFinished && waitCount < 100)
+        {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            waitCount++;
+        }
+
+        // Cleanup semaphores
+        for (int i = 0; i < NUM_BUFFERS; i++)
+        {
+            if (bufferFull[i]) { vSemaphoreDelete(bufferFull[i]); bufferFull[i] = NULL; }
+            if (bufferEmpty[i]) { vSemaphoreDelete(bufferEmpty[i]); bufferEmpty[i] = NULL; }
+        }
+        readerTaskHandle = NULL;
+
+        // Handle skip button debounce
+        if (skipRequested)
+        {
+            uint32_t now = millis();
+            if (now - lastPress >= BOOT_BUTTON_DEBOUCE_TIME)
             {
                 lastPress = now;
             }
         }
         skipRequested = false;
 
-        int time_used = millis() - start_ms;
         Serial.println(F("MJPEG end"));
         mjpegFile.close();
-        skipRequested = false; // ready for next video
-        float fps = 1000.0 * total_frames / time_used;
-        total_decode_video -= total_show_video;
-        Serial.printf("Total frames: %d\n", total_frames);
-        Serial.printf("Time used: %d ms\n", time_used);
-        Serial.printf("Average FPS: %0.1f\n", fps);
-        Serial.printf("Read MJPEG: %lu ms (%0.1f %%)\n", total_read_video, 100.0 * total_read_video / time_used);
-        Serial.printf("Decode video: %lu ms (%0.1f %%)\n", total_decode_video, 100.0 * total_decode_video / time_used);
-        Serial.printf("Show video: %lu ms (%0.1f %%)\n", total_show_video, 100.0 * total_show_video / time_used);
-        Serial.printf("Video size (wxh): %d×%d, scale factor=%d\n",mjpeg.getWidth(),mjpeg.getHeight(),mjpeg.getScale());
+
+        // Print detailed statistics
+        printVideoStats(mjpegFilename);
     }
 }
 

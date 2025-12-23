@@ -57,12 +57,18 @@ public:
 
   bool readMjpegBuf()
   {
+    return readMjpegBufTo(_mjpeg_buf, &_mjpeg_buf_offset);
+  }
+
+  // Read MJPEG frame into a specified target buffer (for dual-core operation)
+  bool readMjpegBufTo(uint8_t *targetBuf, int32_t *outLen)
+  {
     if (_inputindex == 0)
     {
       _buf_read = _input->readBytes(_read_buf, READ_BUFFER_SIZE);
       _inputindex += _buf_read;
     }
-    _mjpeg_buf_offset = 0;
+    uint32_t targetOffset = 0;
     int i = 0;
     bool found_FFD8 = false;
     while ((_buf_read > 0) && (!found_FFD8))
@@ -94,7 +100,7 @@ public:
       i = 3;
       while ((_buf_read > 0) && (!found_FFD9))
       {
-        if ((_mjpeg_buf_offset > 0) && (_mjpeg_buf[_mjpeg_buf_offset - 1] == 0xFF) && (_p[0] == 0xD9)) // JPEG trailer
+        if ((targetOffset > 0) && (targetBuf[targetOffset - 1] == 0xFF) && (_p[0] == 0xD9)) // JPEG trailer
         {
           // Serial.printf("Found FFD9 at: %d.\n", i);
           found_FFD9 = true;
@@ -113,8 +119,8 @@ public:
         }
 
         // Serial.printf("i: %d\n", i);
-        memcpy(_mjpeg_buf + _mjpeg_buf_offset, _p, i);
-        _mjpeg_buf_offset += i;
+        memcpy(targetBuf + targetOffset, _p, i);
+        targetOffset += i;
         size_t o = _buf_read - i;
         if (o > 0)
         {
@@ -136,17 +142,25 @@ public:
       }
       if (found_FFD9)
       {
+        *outLen = targetOffset;
         return true;
       }
     }
 
+    *outLen = 0;
     return false;
   }
 
   bool drawJpg()
   {
-    _remain = _mjpeg_buf_offset;
-    _jpeg.openRAM(_mjpeg_buf, _remain, _pfnDraw);
+    return drawJpgFrom(_mjpeg_buf, _mjpeg_buf_offset);
+  }
+
+  // Draw JPEG from a specified buffer (for dual-core operation)
+  bool drawJpgFrom(uint8_t *srcBuf, int32_t srcLen)
+  {
+    _remain = srcLen;
+    _jpeg.openRAM(srcBuf, _remain, _pfnDraw);
     if (_scale == -1)
     {
       // scale to fit height
