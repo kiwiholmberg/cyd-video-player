@@ -390,8 +390,21 @@ void mjpegPlayFromSDCard(char *mjpegFilename)
                 lastTouchPollTime = now;
                 if (touch.Pressed() && (now - lastTouchSkip >= TOUCH_SKIP_DEBOUNCE_MS))
                 {
-                    lastTouchSkip = now;
-                    skipRequested = true;
+                    int16_t tx = touch.X();
+                    int16_t ty = touch.Y();
+
+                    // Define center touch zone (50% of screen, centered)
+                    int16_t zoneLeft   = gfx->width() / 4;
+                    int16_t zoneRight  = gfx->width() * 3 / 4;
+                    int16_t zoneTop    = gfx->height() / 4;
+                    int16_t zoneBottom = gfx->height() * 3 / 4;
+                    // Only skip if touch is within the center zone, to avoid accidental
+                    // skips when pressing the edges of the screen or case.
+                    if (tx >= zoneLeft && tx <= zoneRight && ty >= zoneTop && ty <= zoneBottom)
+                    {
+                        lastTouchSkip = now;
+                        skipRequested = true;
+                    }
                 }
             }
             touchPollEnd = micros();
